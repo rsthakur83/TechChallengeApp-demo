@@ -1,0 +1,194 @@
+version: 2.1
+#orbs:
+#  github-release: h-matsuo/github-release@0.1.1
+jobs:
+  terraform_backend:
+    docker:
+      - image: golang:1.15
+    description: Create S3 for terraform state file and ecr repo
+    steps:
+      - checkout
+      - run:
+         name: "Terraform S3 backend Bucket and ECR Repo"
+         command: |
+           wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+           apt-get update; apt-get install awscli unzip -y
+           unzip terraform_0.12.0_linux_amd64.zip
+           chmod +x terraform
+           mkdir /root/.aws/
+           echo "[default]"  >> /root/.aws/credentials
+           echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+           echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials        
+           echo `ls -l`
+           echo `pwd`
+           cd backend_ecr
+           sed -i "s/terraform_state_bucket/$terraform_state_bucket/g" backend.tf
+           sed -i "s/aws-region/${aws_region}/g" variable.tf
+           sed -i "s/ecr-repo/${ecr_app}/g" variable.tf
+           sed -i "s/aws-region/${aws_region}/g" ecr_check.sh
+           sed -i "s/ecr-repo/${ecr_app}/g" ecr_check.sh
+           cat ecr_check.sh
+           chmod +x ecr_check.sh
+           ./ecr_check.sh
+
+  build:
+    docker:
+      - image: docker:stable
+    description: Build and Store Artifact on ECR
+    steps:
+      - checkout
+      - setup_remote_docker
+      - run:
+           name: "Clone repo, build and push image to ECR"
+           command: |
+            apk add --no-cache python3 py3-pip git && pip3 install --upgrade pip && pip3 install awscli && rm -rf /var/cache/apk/*
+            mkdir -p /root/.aws/
+            touch /root/.aws/credentials
+            echo "[default]"  >> /root/.aws/credentials
+            echo "region = ${aws_region}" >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials               
+            sed -i "s|app-repo|$app_repo|g"  build/Dockerfile
+            git clone $app_repo
+            export RELEASE_NUMBER="$(cat TechChallengeApp/cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            echo $AWS_ACCOUNT_ID
+            cd build
+            repo=$ecr_app
+            docker build -t $AWS_ACCOUNT_ID.dkr.ecr.$aws_region.amazonaws.com/$repo:$RELEASE_NUMBER  .
+            cred=`aws ecr get-login --no-include-email --region $aws_region`
+            echo '#!/bin/sh' > /tmp/ecr_login.sh
+            echo $cred >> /tmp/ecr_login.sh
+            chmod +x /tmp/ecr_login.sh
+            /tmp/ecr_login.sh
+            docker push $AWS_ACCOUNT_ID.dkr.ecr.$aws_region.amazonaws.com/$repo:$RELEASE_NUMBER
+
+  terraform_deploy:
+    docker:
+      - image: 722c/circle-ci-ubuntu-python-3
+    description: Deploying Infra
+    steps:
+      - checkout
+      - run:
+           name: "Deploy Infra on AWS"
+           command: |
+            apt-get update; apt-get  -y install zip awscli  dos2unix unzip jq git
+            mkdir /root/.aws/
+            echo "[default]" > /root/.aws/config
+            echo "region = ${aws_region}" >> /root/.aws/config
+            echo "[default]"  >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials
+            wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+            unzip terraform_0.12.0_linux_amd64.zip
+            chmod +x terraform
+            cp terraform /bin/
+            git clone $app_repo
+            release_number="$(cat TechChallengeApp/cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            account_id=`aws sts get-caller-identity --query Account --output text`
+            cd ecsrole
+            chmod +x role-check.sh;./role-check.sh
+            cd ../app
+            sed -i  "s/ecr-repo/${ecr_app}/g"                           deploy.sh
+            sed -i  "s|aws-region|$aws_region|g"                        deploy.sh
+            sed -i  "s|aws-region|$aws_region|g"                        ../task_definition.tf
+            sed -i  "s|ecr-repo|$ecr_app|g"                             ../task_definition.tf
+            sed -i  "s|release-number|$release_number|g"                ../task_definition.tf
+            sed -i  "s|account-id|$account_id|g"                        ../task_definition.tf
+            sed -i  "s|app-repo|$app_repo|g"                            deploy.sh
+            sed -i  "s/terraform_state_bucket/$terraform_state_bucket/g" ../terraform_backend.tf
+            sed -i  "s|aws-region|$aws_region|g"                        ../terraform_backend.tf
+            sed -i  "s|aws-region|$aws_region|g"                        ../provider.tf
+            chmod +x deploy.sh
+            sed -i  's/\r$//' deploy.sh
+            ./deploy.sh
+
+  app_status:
+    docker:
+      - image: golang:1.15
+    steps:
+      - checkout
+      - run: apt-get update && apt-get install -y dos2unix postgresql-client unzip docker.io
+      - run:
+         name: "Application Health Check"
+         command: |
+           apt-get update && apt-get install -y dos2unix postgresql-client unzip docker.io
+           wget https://releases.hashicorp.com/terraform/0.12.0/terraform_0.12.0_linux_amd64.zip
+           unzip terraform_0.12.0_linux_amd64.zip
+           chmod +x terraform
+           mkdir /root/.aws/
+           echo "[default]" > /root/.aws/config
+           echo "region = ${aws_region}" >> /root/.aws/config           
+           echo "[default]"  >> /root/.aws/credentials
+           echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+           echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials        
+           cd statebucket; chmod +x check.sh ; chmod +x status.sh
+           sed -i "s|terraform_state_bucket|$terraform_state_bucket|g"  state.tf
+           sed -i "s|aws-region|$aws_region|g" state.tf
+           sed -i "s|aws-region|$aws_region|g" variable.tf
+           ../terraform init
+           sed -i 's/\r$//'  status.sh 
+           sed -i 's/\r$//'  check.sh  
+           ../statebucket/check.sh
+
+  release: 
+    docker:
+      - image: golang:1.15
+    steps:   
+      - checkout
+      - run:
+          name: "Create release after successful deployment"
+          command: |
+            apt-get update; apt-get  -y install zip awscli
+            mkdir /root/.aws/
+            echo "[default]" > /root/.aws/config
+            echo "region = ${aws_region}" >> /root/.aws/config            
+            echo "[default]"  >> /root/.aws/credentials
+            echo "aws_access_key_id = $aws_access_key_id" >>  /root/.aws/credentials
+            echo "aws_secret_access_key = $aws_secret_access_key" >>  /root/.aws/credentials  
+            git clone ${app_repo}
+            cd TechChallengeApp/
+            export RELEASE_NUMBER="$(cat cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            export TAG="$(cat cmd/root.go |grep Version|awk '{print $2}'|cut -d '"' -f2)"
+            export RELEASE_MESSAGE="$(git log -1 --pretty=%B|head -1)"
+            export COMMIT_MESSAGE="$(git log -1 --pretty=%B)"
+            cd ..
+            mkdir artifacts
+            mv TechChallengeApp artifacts/
+            export BODY="## Release Notes
+            ${COMMIT_MESSAGE}"
+            go get github.com/tcnksm/ghr
+            if [[ $TAG =~ "-" ]]; then
+              echo "It's a PRE-Release!"
+              
+              ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1}  -delete  -n  "v${RELEASE_NUMBER}:${RELEASE_MESSAGE}"  -b "${BODY}" -prerelease v${RELEASE_NUMBER}   ./artifacts
+            else
+              echo "It's a Release!"
+              ghr -t ${GITHUB_TOKEN} -u ${CIRCLE_PROJECT_USERNAME} -r ${CIRCLE_PROJECT_REPONAME} -c ${CIRCLE_SHA1}  -delete  -n "v${RELEASE_NUMBER}:${RELEASE_MESSAGE}"  -b "${BODY}"  v${RELEASE_NUMBER}  ./artifacts
+            fi
+
+orbs:
+  aws-ecr: circleci/aws-ecr@6.7.0
+
+workflows:
+  version: 2
+  build_deploy_check_release:
+    jobs:
+      - terraform_backend
+      - build:
+         requires:
+           - terraform_backend
+      - terraform_deploy:
+          requires:
+            - build
+      - app_status:
+          requires:
+           - terraform_deploy
+      - release:
+         requires:
+            - app_status             
+         filters:
+           branches:
+             only: master
+           tags:
+             ignore: /.*/
